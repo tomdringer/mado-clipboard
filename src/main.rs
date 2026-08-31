@@ -1,5 +1,6 @@
 // mado-clipboard — pixel plugin for Mado sidebar
 
+use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -43,6 +44,63 @@ fn load_system_font() -> Option<fontdue::Font> {
     ])
 }
 
+// ── Glyph width cache ─────────────────────────────────────────────────────────
+// fontdue re-rasterizes on every call; caching advance widths eliminates the
+// dominant CPU cost (repeated full bitmap render just to get the advance width).
+
+struct GlyphCache {
+    font: fontdue::Font,
+    widths: HashMap<(u32, u32), usize>, // (char as u32, size_bits) → advance px
+}
+
+impl GlyphCache {
+    fn new(font: fontdue::Font) -> Self {
+        GlyphCache { font, widths: HashMap::new() }
+    }
+
+    fn advance(&mut self, ch: char, size: f32) -> usize {
+        let key = (ch as u32, size.to_bits());
+        if let Some(&w) = self.widths.get(&key) {
+            return w;
+        }
+        let (m, _) = self.font.rasterize(ch, size);
+        let w = m.advance_width.round() as usize;
+        self.widths.insert(key, w);
+        w
+    }
+
+    fn measure(&mut self, text: &str, size: f32) -> usize {
+        text.chars().map(|ch| self.advance(ch, size)).sum()
+    }
+
+    /// Render text into a pixel buffer, returning the x position after the last char.
+    fn draw_text(&mut self, buf: &mut [u8], stride: usize, h: usize,
+                 text: &str, size: f32, mut cx: usize, y: usize, color: [u8; 4]) -> usize {
+        for ch in text.chars() {
+            let (m, bmp) = self.font.rasterize(ch, size);
+            // cache the width while we have the metrics
+            self.widths.insert((ch as u32, size.to_bits()), m.advance_width.round() as usize);
+            let gx = cx as isize + m.xmin as isize;
+            let gy = y as isize - m.height as isize - m.ymin as isize;
+            for (k, &cov) in bmp.iter().enumerate() {
+                if cov == 0 { continue; }
+                let px = gx + (k % m.width) as isize;
+                let py = gy + (k / m.width) as isize;
+                if px < 0 || py < 0 || px as usize >= stride || py as usize >= h { continue; }
+                let i = (py as usize * stride + px as usize) * 4;
+                let a = cov as f32 / 255.0;
+                let ia = 1.0 - a;
+                for c in 0..3 {
+                    buf[i + c] = (buf[i + c] as f32 * ia + color[c] as f32 * a) as u8;
+                }
+                buf[i + 3] = 255;
+            }
+            cx += m.advance_width.round() as usize;
+        }
+        cx
+    }
+}
+
 // ── Canvas ────────────────────────────────────────────────────────────────────
 
 struct Canvas { pixels: Vec<u8>, w: usize, h: usize }
@@ -63,50 +121,12 @@ impl Canvas {
         }
     }
 
-    fn blend(&mut self, x: usize, y: usize, color: [u8; 4], alpha: f32) {
-        if x >= self.w || y >= self.h { return; }
-        let i = (y * self.w + x) * 4;
-        let ia = 1.0 - alpha;
-        for c in 0..3 {
-            self.pixels[i + c] =
-                (self.pixels[i + c] as f32 * ia + color[c] as f32 * alpha).round() as u8;
-        }
-        self.pixels[i + 3] = 255;
-    }
-
-    fn text(&mut self, font: &fontdue::Font, text: &str,
-            size: f32, x: usize, y: usize, color: [u8; 4]) -> usize {
-        let mut cx = x;
-        for ch in text.chars() {
-            let (m, bmp) = font.rasterize(ch, size);
-            let gx = cx as isize + m.xmin as isize;
-            let gy = y as isize - m.height as isize - m.ymin as isize;
-            for (k, &cov) in bmp.iter().enumerate() {
-                if cov == 0 { continue; }
-                let px = gx + (k % m.width) as isize;
-                let py = gy + (k / m.width) as isize;
-                if px >= 0 && py >= 0 {
-                    self.blend(px as usize, py as usize, color, cov as f32 / 255.0);
-                }
-            }
-            cx += m.advance_width.round() as usize;
-        }
-        cx
-    }
-
-    fn measure(font: &fontdue::Font, text: &str, size: f32) -> usize {
-        text.chars().map(|ch| {
-            let (m, _) = font.rasterize(ch, size);
-            m.advance_width.round() as usize
-        }).sum()
-    }
-
-    fn write_frame(&self, out: &mut impl Write) {
-        out.write_all(b"MADO").unwrap();
-        out.write_all(&(self.w as u32).to_le_bytes()).unwrap();
-        out.write_all(&(self.h as u32).to_le_bytes()).unwrap();
-        out.write_all(&self.pixels).unwrap();
-        out.flush().unwrap();
+    fn write_frame(&self, out: &mut impl Write) -> std::io::Result<()> {
+        out.write_all(b"MADO")?;
+        out.write_all(&(self.w as u32).to_le_bytes())?;
+        out.write_all(&(self.h as u32).to_le_bytes())?;
+        out.write_all(&self.pixels)?;
+        out.flush()
     }
 }
 
@@ -188,6 +208,7 @@ struct State {
     copied_idx: Option<usize>,
     last_clip:  Option<String>,
     focused:    bool,
+    dirty:      bool, // set whenever visible state changes; cleared after render
 }
 
 impl State {
@@ -195,7 +216,7 @@ impl State {
         let history = load_history();
         let last_clip = history.first().cloned();
         State { history, filter: String::new(), scroll_off: 0,
-                copied_idx: None, last_clip, focused: false }
+                copied_idx: None, last_clip, focused: false, dirty: true }
     }
 
     fn push(&mut self, s: String) {
@@ -204,6 +225,7 @@ impl State {
         if self.history.len() > 100 { self.history.truncate(100); }
         self.last_clip = Some(s);
         save_history(&self.history);
+        self.dirty = true;
     }
 
     fn filtered(&self) -> Vec<(usize, &str)> {
@@ -221,22 +243,22 @@ const SEARCH_H: usize = 36;
 const ITEM_H:   usize = 44;
 const PAD:      usize = 12;
 
-fn render(state: &State, font: &fontdue::Font, w: usize, h: usize, out: &mut impl Write) {
+fn render(state: &State, cache: &mut GlyphCache, w: usize, h: usize, out: &mut impl Write) -> bool {
     let mut canvas = Canvas::new(w, h);
     let text_size:  f32 = (w as f32 * 0.075).clamp(11.0, 15.0);
     let small_size: f32 = (w as f32 * 0.06).clamp(9.0, 12.0);
 
     // Search bar
     canvas.fill_rect(PAD, 8, w - PAD * 2, SEARCH_H, SEARCH_BG);
-    // Border: accent when focused, dim outline when not
     let border_color = if state.focused { ACCENT } else { BG_SEL };
-    canvas.fill_rect(PAD, 8, w - PAD * 2, 1, border_color);                   // top
-    canvas.fill_rect(PAD, 8 + SEARCH_H - 1, w - PAD * 2, 1, border_color);   // bottom
-    canvas.fill_rect(PAD, 8, 1, SEARCH_H, border_color);                      // left
-    canvas.fill_rect(PAD + w - PAD * 2 - 1, 8, 1, SEARCH_H, border_color);   // right
+    canvas.fill_rect(PAD, 8, w - PAD * 2, 1, border_color);
+    canvas.fill_rect(PAD, 8 + SEARCH_H - 1, w - PAD * 2, 1, border_color);
+    canvas.fill_rect(PAD, 8, 1, SEARCH_H, border_color);
+    canvas.fill_rect(PAD + w - PAD * 2 - 1, 8, 1, SEARCH_H, border_color);
     let placeholder = if state.filter.is_empty() { "Search..." } else { &state.filter };
     let color = if state.filter.is_empty() { DIM } else { TEXT };
-    canvas.text(font, placeholder, text_size, PAD + 10, 8 + SEARCH_H - 10, color);
+    cache.draw_text(&mut canvas.pixels, canvas.w, canvas.h,
+                    placeholder, text_size, PAD + 10, 8 + SEARCH_H - 10, color);
 
     // Items
     let list_top = 8 + SEARCH_H + 8;
@@ -253,23 +275,38 @@ fn render(state: &State, font: &fontdue::Font, w: usize, h: usize, out: &mut imp
         canvas.fill_rect(PAD, iy + 2, w - PAD * 2, ITEM_H - 4, bg);
 
         let max_w = w - PAD * 2 - 16;
-        let mut display = text.replace('\n', " ↵ ").replace('\t', "  ");
-        if Canvas::measure(font, &display, text_size) > max_w {
-            while Canvas::measure(font, &format!("{display}…"), text_size) > max_w
-                && !display.is_empty() { display.pop(); }
-            display.push('…');
+        let mut display: String = text.replace('\n', " ↵ ").replace('\t', "  ");
+        // Truncate to fit: estimate chars that fit, then trim precisely
+        let approx_char_w = cache.advance('m', text_size).max(1);
+        let approx_chars = max_w / approx_char_w;
+        if display.len() > approx_chars + 4 {
+            let n = (0..=(approx_chars + 4))
+                .rev()
+                .find(|&i| display.is_char_boundary(i))
+                .unwrap_or(0);
+            display.truncate(n);
         }
-        canvas.text(font, &display, text_size, PAD + 8, iy + ITEM_H - 14, TEXT);
+        // Fine-tune with ellipsis
+        while cache.measure(&format!("{display}…"), text_size) > max_w && !display.is_empty() {
+            display.pop();
+        }
+        if cache.measure(text, text_size) > max_w { display.push('…'); }
+
+        cache.draw_text(&mut canvas.pixels, canvas.w, canvas.h,
+                        &display, text_size, PAD + 8, iy + ITEM_H - 14, TEXT);
 
         let hint = format!("{} chars", text.len());
-        let hint_x = w.saturating_sub(PAD + Canvas::measure(font, &hint, small_size) + 4);
-        canvas.text(font, &hint, small_size, hint_x, iy + ITEM_H - 14, DIM);
+        let hint_w = cache.measure(&hint, small_size);
+        let hint_x = w.saturating_sub(PAD + hint_w + 4);
+        cache.draw_text(&mut canvas.pixels, canvas.w, canvas.h,
+                        &hint, small_size, hint_x, iy + ITEM_H - 14, DIM);
     }
 
     if filtered.is_empty() {
         let msg = if state.history.is_empty() { "Nothing copied yet" } else { "No matches" };
-        let mw = Canvas::measure(font, msg, text_size);
-        canvas.text(font, msg, text_size, w.saturating_sub(mw) / 2, h / 2, DIM);
+        let mw = cache.measure(msg, text_size);
+        cache.draw_text(&mut canvas.pixels, canvas.w, canvas.h,
+                        msg, text_size, w.saturating_sub(mw) / 2, h / 2, DIM);
     }
 
     // Scrollbar
@@ -281,7 +318,7 @@ fn render(state: &State, font: &fontdue::Font, w: usize, h: usize, out: &mut imp
         canvas.fill_rect(w - 4, thumb_y, 3, thumb_h, BG_SEL);
     }
 
-    canvas.write_frame(out);
+    canvas.write_frame(out).is_ok()
 }
 
 // ── Main ──────────────────────────────────────────────────────────────────────
@@ -309,9 +346,6 @@ fn main() {
         });
     }
 
-    // Stdin event listener
-    // Note: stdout is shared with the render loop. We use a Mutex so the
-    // event thread can write MACT actions without racing with MADO frames.
     let stdout_shared: Arc<Mutex<std::io::BufWriter<std::io::Stdout>>> =
         Arc::new(Mutex::new(std::io::BufWriter::new(std::io::stdout())));
 
@@ -326,7 +360,10 @@ fn main() {
                     match ev.kind.as_str() {
                         "resize" => {
                             if let (Some(w), Some(h)) = (ev.width, ev.height) {
-                                if w > 0 && h > 0 { *dims.lock().unwrap() = (w, h); }
+                                if w > 0 && h > 0 {
+                                    *dims.lock().unwrap() = (w, h);
+                                    state.lock().unwrap().dirty = true;
+                                }
                             }
                         }
                         "click" => {
@@ -346,8 +383,8 @@ fn main() {
                                         st.history.retain(|h| h != &owned);
                                         st.history.insert(0, owned);
                                         save_history(&st.history);
+                                        st.dirty = true;
                                         drop(st);
-                                        // Tell Mado to paste into the focused terminal.
                                         if let Ok(mut out) = stdout.lock() {
                                             send_action(&mut *out, "paste");
                                         }
@@ -359,26 +396,27 @@ fn main() {
                             if let Some(text) = ev.text {
                                 let mut st = state.lock().unwrap();
                                 match text.as_str() {
-                                    "\u{0008}" | "\u{007F}" => { st.filter.pop(); }
-                                    "\u{001B}" => { st.filter.clear(); }
+                                    "\u{0008}" | "\u{007F}" => { st.filter.pop(); st.dirty = true; }
+                                    "\u{001B}" => { st.filter.clear(); st.dirty = true; }
                                     t if t.len() == 1 && !t.starts_with('\u{00}') => {
                                         st.filter.push_str(t);
                                         st.scroll_off = 0;
+                                        st.dirty = true;
                                     }
                                     _ => {}
                                 }
                             }
                         }
-                        "focus" => { state.lock().unwrap().focused = true; }
-                        "blur"  => { state.lock().unwrap().focused = false; }
+                        "focus" => { let mut st = state.lock().unwrap(); st.focused = true;  st.dirty = true; }
+                        "blur"  => { let mut st = state.lock().unwrap(); st.focused = false; st.dirty = true; }
                         "scroll" => {
                             if let Some(delta) = ev.delta {
                                 let mut st = state.lock().unwrap();
                                 let len = st.filtered().len();
                                 if delta > 0.0 {
-                                    if st.scroll_off + 1 < len { st.scroll_off += 1; }
+                                    if st.scroll_off + 1 < len { st.scroll_off += 1; st.dirty = true; }
                                 } else if st.scroll_off > 0 {
-                                    st.scroll_off -= 1;
+                                    st.scroll_off -= 1; st.dirty = true;
                                 }
                             }
                         }
@@ -389,20 +427,36 @@ fn main() {
         });
     }
 
+    let mut cache = GlyphCache::new(font);
     let mut tick: u32 = 0;
+
     loop {
         let (w, h) = *dims.lock().unwrap();
         let (w, h) = (w as usize, h as usize);
-        {
+
+        let should_render = {
             let mut st = state.lock().unwrap();
+            // Always tick the copied_idx flash (2 ticks ≈ 1s) even if not otherwise dirty
             if st.copied_idx.is_some() {
                 tick += 1;
                 if tick >= 2 { st.copied_idx = None; tick = 0; }
+                st.dirty = true;
             }
+            let d = st.dirty;
+            st.dirty = false;
+            d
+        };
+
+        if should_render {
+            let st = state.lock().unwrap();
             if let Ok(mut out) = stdout_shared.lock() {
-                render(&st, &font, w, h, &mut *out);
+                if !render(&st, &mut cache, w, h, &mut *out) {
+                    // Write failed (broken pipe) — exit cleanly
+                    break;
+                }
             }
         }
+
         std::thread::sleep(Duration::from_millis(500));
     }
 }
