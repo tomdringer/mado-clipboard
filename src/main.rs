@@ -156,12 +156,18 @@ struct Event {
 
 // ── Clipboard polling ─────────────────────────────────────────────────────────
 
+// macOS uses pbpaste/pbcopy. Elsewhere arboard does the work; on Linux the
+// process that set the clipboard must keep serving it, so both the polling and
+// click threads share one long-lived instance.
+
+#[cfg(target_os = "macos")]
 fn read_clipboard() -> Option<String> {
     let out = std::process::Command::new("pbpaste").output().ok()?;
     let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
     if s.is_empty() { None } else { Some(s) }
 }
 
+#[cfg(target_os = "macos")]
 fn write_clipboard(text: &str) {
     use std::process::{Command, Stdio};
     if let Ok(mut child) = Command::new("pbcopy").stdin(Stdio::piped()).spawn() {
@@ -170,6 +176,27 @@ fn write_clipboard(text: &str) {
         }
         let _ = child.wait();
     }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn with_clipboard<T>(f: impl FnOnce(&mut arboard::Clipboard) -> Option<T>) -> Option<T> {
+    static CLIPBOARD: Mutex<Option<arboard::Clipboard>> = Mutex::new(None);
+    let mut cb = CLIPBOARD.lock().ok()?;
+    if cb.is_none() {
+        *cb = arboard::Clipboard::new().ok();
+    }
+    f(cb.as_mut()?)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn read_clipboard() -> Option<String> {
+    let s = with_clipboard(|cb| cb.get_text().ok())?.trim().to_string();
+    if s.is_empty() { None } else { Some(s) }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn write_clipboard(text: &str) {
+    with_clipboard(|cb| cb.set_text(text).ok());
 }
 
 // ── History persistence ───────────────────────────────────────────────────────
